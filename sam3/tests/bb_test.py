@@ -480,9 +480,9 @@ def run_predict(image_paths, text_prompt, exemplar, device, threshold,
             masks_path = os.path.join(output_dir, f"{stem}_masks.npy")
             boxes_path = os.path.join(output_dir, f"{stem}_boxes.npy")
             scores_path = os.path.join(output_dir, f"{stem}_scores.npy")
-            np.save(masks_path, masks.cpu().numpy())
-            np.save(boxes_path, boxes.cpu().numpy())
-            np.save(scores_path, scores.cpu().numpy())
+            np.save(masks_path, masks.cpu().float().numpy())
+            np.save(boxes_path, boxes.cpu().float().numpy())
+            np.save(scores_path, scores.cpu().float().numpy())
             entry["masks"] = f"{stem}_masks.npy"
             entry["boxes"] = f"{stem}_boxes.npy"
             entry["scores"] = f"{stem}_scores.npy"
