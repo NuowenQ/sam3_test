@@ -609,32 +609,50 @@ def result_viewer(image, model, state, title, show_masks):
     deleted = set()  # indices of deleted detections
     deleted_history = []  # stack for undo-delete via [Z]
 
+    # User-created detections (clicking outside any existing box)
+    custom = {
+        "masks": [],      # list of np.ndarray (H, W)
+        "boxes": [],      # list of np.ndarray (4,) xyxy
+        "scores": [],     # list of float
+        "logits": [],     # list of np.ndarray (256, 256)
+        "points": [],     # list of [(px, py), ...]
+        "labels": [],     # list of [1 or 0, ...]
+    }
+
     fig, ax = plt.subplots(1, 1, figsize=(13, 9))
     fig.patch.set_facecolor("#1e1e1e")
     ax.set_facecolor("#1e1e1e")
     action = {"value": "next"}
 
     def get_visible_indices():
-        """Return list of object indices that are not deleted."""
+        """Return list of grounding object indices that are not deleted."""
         return [i for i in range(n_objects) if i not in deleted]
 
     def get_display_data():
-        """Build filtered masks/boxes/scores excluding deleted objects."""
-        if grounding_masks is None or n_objects == 0:
-            return grounding_masks, grounding_boxes, grounding_scores, []
-        visible = get_visible_indices()
-        if not visible:
-            return None, None, None, []
+        """Build combined masks/boxes/scores from grounding + custom, excluding deleted."""
+        device = grounding_masks.device if grounding_masks is not None else "cpu"
         masks = []
         boxes = []
         scores = []
+
+        # Grounding detections (not deleted)
+        visible = get_visible_indices()
         for i in visible:
             if refined["masks"][i] is not None:
-                masks.append(torch.from_numpy(refined["masks"][i]).to(grounding_masks.device))
+                masks.append(torch.from_numpy(refined["masks"][i]).to(device))
             else:
                 masks.append(grounding_masks[i])
             boxes.append(grounding_boxes[i])
             scores.append(grounding_scores[i])
+
+        # Custom (user-created) detections
+        for i in range(len(custom["masks"])):
+            masks.append(torch.from_numpy(custom["masks"][i]).to(device))
+            boxes.append(torch.from_numpy(custom["boxes"][i]).to(device))
+            scores.append(torch.tensor(custom["scores"][i]).to(device))
+
+        if not masks:
+            return None, None, None, visible
         return torch.stack(masks), torch.stack(boxes), torch.stack(scores), visible
 
     def redraw():
@@ -649,14 +667,17 @@ def result_viewer(image, model, state, title, show_masks):
         if boxes is not None and scores is not None:
             _draw_output_boxes(ax, boxes, scores, colors)
 
-        # Draw all refinement points for visible objects
+        # Draw refinement points for visible grounding objects
         for i in visible:
             _draw_points(ax, refined["points"][i], refined["labels"][i])
+        # Draw points for custom detections
+        for i in range(len(custom["points"])):
+            _draw_points(ax, custom["points"][i], custom["labels"][i])
 
-        n_visible = len(visible)
+        n_total = len(visible) + len(custom["masks"])
         n_del = len(deleted)
         del_str = f" ({n_del} deleted)" if n_del else ""
-        hud = (f"{title}  —  {n_visible} obj{del_str}    "
+        hud = (f"{title}  —  {n_total} obj{del_str}    "
                f"[click] include  [Ctrl+click] exclude  [right-click] delete  "
                f"[U] undo pt  [Z] undo del  [R] reset all  [M] mask  [SPACE] next  [Q] quit")
         ax.set_title(hud, color="white", fontsize=9)
@@ -664,19 +685,23 @@ def result_viewer(image, model, state, title, show_masks):
         fig.canvas.draw_idle()
 
     def find_object_at(px, py):
-        """Find which detected object's box contains (px, py). Returns index or -1."""
-        if grounding_boxes is None:
-            return -1
-        for i, box in enumerate(grounding_boxes):
-            if i in deleted:
-                continue
+        """Find which object's box contains (px, py).
+        Returns ("grounding", idx), ("custom", idx), or (None, -1)."""
+        if grounding_boxes is not None:
+            for i, box in enumerate(grounding_boxes):
+                if i in deleted:
+                    continue
+                x1, y1, x2, y2 = box.tolist()
+                if x1 <= px <= x2 and y1 <= py <= y2:
+                    return "grounding", i
+        for i, box in enumerate(custom["boxes"]):
             x1, y1, x2, y2 = box.tolist()
             if x1 <= px <= x2 and y1 <= py <= y2:
-                return i
-        return -1
+                return "custom", i
+        return None, -1
 
     def refine_object(obj_idx):
-        """Re-run predict_inst for object obj_idx with its accumulated points."""
+        """Re-run predict_inst for a grounding object with its accumulated points."""
         box = grounding_boxes[obj_idx].cpu().numpy()  # xyxy
         pts = np.array(refined["points"][obj_idx])  # (N, 2)
         lbls = np.array(refined["labels"][obj_idx])  # (N,)
@@ -687,16 +712,45 @@ def result_viewer(image, model, state, title, show_masks):
             "box": box[None, :],  # (1, 4)
             "multimask_output": False,
         }
-        # Feed previous logits for iterative refinement
         if refined["logits"][obj_idx] is not None:
             kwargs["mask_input"] = refined["logits"][obj_idx][None, :, :]
 
         with torch.inference_mode():
             masks_np, scores_np, logits_np = model.predict_inst(state, **kwargs)
 
-        # masks_np: (1, H, W), scores_np: (1,), logits_np: (1, 256, 256)
         refined["masks"][obj_idx] = masks_np[0]
         refined["logits"][obj_idx] = logits_np[0]
+
+    def run_custom_predict(cidx):
+        """Run predict_inst for a custom (user-created) detection."""
+        pts = np.array(custom["points"][cidx])
+        lbls = np.array(custom["labels"][cidx])
+
+        kwargs = {
+            "point_coords": pts,
+            "point_labels": lbls,
+            "multimask_output": len(pts) == 1,  # multi for first click, single after
+        }
+        if custom["logits"][cidx] is not None:
+            kwargs["mask_input"] = custom["logits"][cidx][None, :, :]
+            kwargs["multimask_output"] = False
+
+        with torch.inference_mode():
+            masks_np, scores_np, logits_np = model.predict_inst(state, **kwargs)
+
+        # Pick best mask if multimask
+        best = int(scores_np.argmax())
+        custom["masks"][cidx] = masks_np[best]
+        custom["scores"][cidx] = float(scores_np[best])
+        custom["logits"][cidx] = logits_np[best]
+
+        # Derive bounding box from mask
+        ys, xs = np.where(masks_np[best])
+        if len(xs) > 0:
+            custom["boxes"][cidx] = np.array([xs.min(), ys.min(), xs.max(), ys.max()],
+                                              dtype=np.float32)
+        else:
+            custom["boxes"][cidx] = np.array([0, 0, 0, 0], dtype=np.float32)
 
     def on_click(event):
         if event.inaxes != ax or event.xdata is None:
@@ -705,35 +759,57 @@ def result_viewer(image, model, state, title, show_masks):
 
         # Right-click: delete the detection under cursor
         if event.button == 3:
-            obj_idx = find_object_at(px, py)
-            if obj_idx < 0:
-                print(f"  Right-click at ({px:.0f}, {py:.0f}) — not inside any detected box")
+            source, idx = find_object_at(px, py)
+            if source == "grounding":
+                deleted.add(idx)
+                deleted_history.append(("grounding", idx))
+                print(f"  Deleted grounding object {idx}")
+            elif source == "custom":
+                # Remove custom detection entirely
+                for key in custom:
+                    custom[key].pop(idx)
+                deleted_history.append(("custom_removed", None))
+                print(f"  Deleted custom object {idx}")
+            else:
+                print(f"  Right-click at ({px:.0f}, {py:.0f}) — not inside any box")
                 return
-            deleted.add(obj_idx)
-            deleted_history.append(obj_idx)
-            print(f"  Deleted object {obj_idx}")
             redraw()
             return
 
         if event.button != 1:
             return
 
-        # Left-click: add refinement point
+        # Left-click: refine existing or create new detection
         is_positive = event.key != "control"
         label = 1 if is_positive else 0
-
-        obj_idx = find_object_at(px, py)
-        if obj_idx < 0:
-            print(f"  Click at ({px:.0f}, {py:.0f}) — not inside any detected box")
-            return
-
-        refined["points"][obj_idx].append((px, py))
-        refined["labels"][obj_idx].append(label)
-
         tag = "include" if label else "exclude"
-        print(f"  {tag} point on object {obj_idx}: ({px:.0f}, {py:.0f})")
 
-        refine_object(obj_idx)
+        source, idx = find_object_at(px, py)
+
+        if source == "grounding":
+            # Refine existing grounding detection
+            refined["points"][idx].append((px, py))
+            refined["labels"][idx].append(label)
+            print(f"  {tag} point on grounding obj {idx}: ({px:.0f}, {py:.0f})")
+            refine_object(idx)
+        elif source == "custom":
+            # Refine existing custom detection
+            custom["points"][idx].append((px, py))
+            custom["labels"][idx].append(label)
+            print(f"  {tag} point on custom obj {idx}: ({px:.0f}, {py:.0f})")
+            run_custom_predict(idx)
+        else:
+            # Click outside any box → create new custom detection
+            custom["masks"].append(None)
+            custom["boxes"].append(np.array([0, 0, 0, 0], dtype=np.float32))
+            custom["scores"].append(0.0)
+            custom["logits"].append(None)
+            custom["points"].append([(px, py)])
+            custom["labels"].append([label])
+            cidx = len(custom["masks"]) - 1
+            print(f"  New detection from click at ({px:.0f}, {py:.0f})")
+            run_custom_predict(cidx)
+
         redraw()
 
     def on_key(event):
@@ -749,28 +825,51 @@ def result_viewer(image, model, state, title, show_masks):
             show_masks = not show_masks
             redraw()
         elif event.key == "u":
-            # Undo last point across all objects (find most recent)
-            last_obj = -1
-            for i in range(n_objects):
-                if refined["points"][i]:
-                    last_obj = i
-            if last_obj < 0:
-                return
-            refined["points"][last_obj].pop()
-            refined["labels"][last_obj].pop()
-            if refined["points"][last_obj]:
-                refine_object(last_obj)
-            else:
-                # No more refine points — revert to grounding mask
-                refined["masks"][last_obj] = None
-                refined["logits"][last_obj] = None
-            print(f"  Undone last refine point on object {last_obj}")
+            # Undo last point: check custom detections first (most recent),
+            # then grounding refinements
+            undone = False
+
+            # Check custom detections (last one with points)
+            for ci in range(len(custom["points"]) - 1, -1, -1):
+                if custom["points"][ci]:
+                    custom["points"][ci].pop()
+                    custom["labels"][ci].pop()
+                    if custom["points"][ci]:
+                        run_custom_predict(ci)
+                    else:
+                        # No points left — remove this custom detection
+                        for key in custom:
+                            custom[key].pop(ci)
+                    print(f"  Undone last point on custom obj {ci}")
+                    undone = True
+                    break
+
+            if not undone:
+                # Check grounding refinements
+                last_obj = -1
+                for i in range(n_objects):
+                    if refined["points"][i]:
+                        last_obj = i
+                if last_obj < 0:
+                    return
+                refined["points"][last_obj].pop()
+                refined["labels"][last_obj].pop()
+                if refined["points"][last_obj]:
+                    refine_object(last_obj)
+                else:
+                    refined["masks"][last_obj] = None
+                    refined["logits"][last_obj] = None
+                print(f"  Undone last refine point on grounding obj {last_obj}")
+
             redraw()
         elif event.key == "z":
             if deleted_history:
-                restored = deleted_history.pop()
-                deleted.discard(restored)
-                print(f"  Restored object {restored}")
+                kind, idx = deleted_history.pop()
+                if kind == "grounding":
+                    deleted.discard(idx)
+                    print(f"  Restored grounding object {idx}")
+                elif kind == "custom_removed":
+                    print("  Cannot undo custom deletion (re-click to recreate)")
                 redraw()
             else:
                 print("  Nothing to restore")
@@ -782,7 +881,9 @@ def result_viewer(image, model, state, title, show_masks):
                 refined["labels"][i].clear()
             deleted.clear()
             deleted_history.clear()
-            print("  All refinements & deletions reset")
+            for key in custom:
+                custom[key].clear()
+            print("  All refinements, deletions & custom detections reset")
             redraw()
 
     fig.canvas.mpl_connect("button_press_event", on_click)
