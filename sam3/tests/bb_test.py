@@ -1,0 +1,879 @@
+"""
+SAM3 segmentation testing pipeline with split predict/refine stages.
+
+Three-step workflow:
+  1. Define exemplar:  draw boxes on a reference image, saved to a JSON file
+  2. Run prediction:   load exemplar + text, run model, save masks to disk
+  3. Run refinement:   load saved masks, click to refine interactively
+
+Splitting prediction and refinement avoids GPU memory explosion from running
+the text/exemplar grounding pipeline and interactive refinement together.
+
+Usage:
+    # Step 1: Define exemplar (draws on ref image, saves to exemplar.json)
+    python bb_test.py --define-exemplar ref_image.jpg
+
+    # Step 2: Predict — saves masks/boxes/scores to predictions/ dir
+    python bb_test.py --predict images/ --exemplar exemplar.json --text "sawfish card"
+
+    # Step 3: Refine — loads predictions, click to refine masks interactively
+    python bb_test.py --refine predictions/
+
+    # Text-only prediction (no exemplar)
+    python bb_test.py --predict images/ --text "dog"
+
+Exemplar window controls:
+    Click:        add positive point (green star)
+    Ctrl+click:   add negative point (red star)
+    Drag:         draw positive box
+    Ctrl+drag:    draw negative box
+    U:            undo last prompt
+    ENTER:        save & quit
+    Q:            cancel
+
+Refinement window controls:
+    Click:        add positive refine point
+    Ctrl+click:   add negative refine point
+    U:            undo last refine point
+    R:            reset refinements (back to prediction result)
+    M:            toggle mask overlay
+    SPACE / D:    next image
+    Q:            quit
+"""
+import argparse
+import glob
+import json
+import os
+import sys
+
+import numpy as np
+import matplotlib
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+import torch
+from PIL import Image
+
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
+
+
+# ---------------------------------------------------------------------------
+# ExemplarPrompts — normalized coords, serializable to JSON
+# ---------------------------------------------------------------------------
+class ExemplarPrompts:
+    def __init__(self):
+        self.points = []  # [(x_norm, y_norm, label), ...]
+        self.boxes = []   # [(cx_norm, cy_norm, w_norm, h_norm, is_positive), ...]
+
+    def add_point(self, x_norm, y_norm, label):
+        self.points.append((x_norm, y_norm, int(label)))
+
+    def add_box(self, cx, cy, w, h, is_positive):
+        self.boxes.append((cx, cy, w, h, bool(is_positive)))
+
+    def is_empty(self):
+        return not self.points and not self.boxes
+
+    def summary(self):
+        parts = []
+        if self.points:
+            parts.append(f"{len(self.points)} point(s)")
+        if self.boxes:
+            parts.append(f"{len(self.boxes)} box(es)")
+        return ", ".join(parts) if parts else "empty"
+
+    def save(self, path):
+        data = {"points": self.points, "boxes": self.boxes}
+        with open(path, "w") as f:
+            json.dump(data, f, indent=2)
+
+    @classmethod
+    def load(cls, path):
+        with open(path) as f:
+            data = json.load(f)
+        ex = cls()
+        ex.points = [tuple(p) for p in data.get("points", [])]
+        ex.boxes = [tuple(b) for b in data.get("boxes", [])]
+        return ex
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def collect_images(path: str) -> list[str]:
+    if os.path.isfile(path):
+        return [os.path.abspath(path)]
+    if os.path.isdir(path):
+        files = []
+        for ext in IMAGE_EXTENSIONS:
+            files.extend(glob.glob(os.path.join(path, f"*{ext}")))
+            files.extend(glob.glob(os.path.join(path, f"*{ext.upper()}")))
+        return sorted(set(os.path.abspath(f) for f in files))
+    print(f"Error: {path} is not a valid file or directory")
+    sys.exit(1)
+
+
+def overlay_masks(image, masks):
+    rgba = image.convert("RGBA")
+    if masks is None or len(masks) == 0:
+        return rgba, []
+    mask_np = 255 * masks.cpu().numpy().astype(np.uint8)
+    n = mask_np.shape[0]
+    if n == 0:
+        return rgba, []
+    cmap = matplotlib.colormaps.get_cmap("rainbow").resampled(max(n, 1))
+    colors = [tuple(int(c * 255) for c in cmap(i)[:3]) for i in range(n)]
+    for mask, color in zip(mask_np, colors):
+        m = Image.fromarray(mask)
+        overlay = Image.new("RGBA", rgba.size, color + (0,))
+        alpha = m.point(lambda v: int(v * 0.5))
+        overlay.putalpha(alpha)
+        rgba = Image.alpha_composite(rgba, overlay)
+    return rgba, colors
+
+
+def _draw_output_boxes(ax, boxes, scores, colors):
+    if boxes is None:
+        return
+    for i, (box, score) in enumerate(zip(boxes, scores)):
+        x1, y1, x2, y2 = box.tolist() if hasattr(box, "tolist") else box
+        cn = [c / 255.0 for c in colors[i]]
+        rect = patches.Rectangle(
+            (x1, y1), x2 - x1, y2 - y1,
+            linewidth=2, edgecolor=cn, facecolor="none",
+        )
+        ax.add_patch(rect)
+        ax.text(
+            x1, y1 - 4, f"{score:.2f}",
+            color="white", fontsize=9, fontweight="bold",
+            bbox=dict(boxstyle="round,pad=0.2", facecolor=cn, alpha=0.7),
+        )
+
+
+def _draw_points(ax, points_px, labels):
+    """Draw click points in pixel coords."""
+    for (px, py), label in zip(points_px, labels):
+        color = "lime" if label == 1 else "red"
+        ax.plot(px, py, marker="*", markersize=18, color=color,
+                markeredgecolor="white", markeredgewidth=1.0)
+
+
+def _draw_boxes_norm(ax, boxes_norm, width, height):
+    """Draw normalized exemplar boxes."""
+    for (cx, cy, w, h, is_pos) in boxes_norm:
+        x1 = (cx - w / 2) * width
+        y1 = (cy - h / 2) * height
+        ec = "lime" if is_pos else "red"
+        rect = patches.Rectangle(
+            (x1, y1), w * width, h * height,
+            linewidth=2, edgecolor=ec, facecolor="none", linestyle="--",
+        )
+        ax.add_patch(rect)
+
+
+# ---------------------------------------------------------------------------
+# Model helpers
+# ---------------------------------------------------------------------------
+def add_point_prompt(processor, state, px_norm, py_norm, label, device):
+    if "geometric_prompt" not in state:
+        state["geometric_prompt"] = processor.model._get_dummy_prompt()
+    if "language_features" not in state["backbone_out"]:
+        dummy = processor.model.backbone.forward_text(["visual"], device=device)
+        state["backbone_out"].update(dummy)
+
+    point = torch.tensor([px_norm, py_norm], device=device, dtype=torch.float32).view(1, 1, 2)
+    lbl = torch.tensor([label], device=device, dtype=torch.bool).view(1, 1)
+    state["geometric_prompt"].append_points(point, lbl)
+    return processor._forward_grounding(state)
+
+
+@torch.inference_mode()
+def apply_exemplar_prompts(processor, state, text_prompt, exemplar, device):
+    if text_prompt:
+        state = processor.set_text_prompt(prompt=text_prompt, state=state)
+    if exemplar is None or exemplar.is_empty():
+        return state
+    for cx, cy, w, h, is_positive in exemplar.boxes:
+        state = processor.add_geometric_prompt(
+            state=state, box=[cx, cy, w, h], label=is_positive
+        )
+    for xn, yn, label in exemplar.points:
+        state = add_point_prompt(processor, state, xn, yn, label, device)
+    return state
+
+
+def auto_find_checkpoint():
+    try:
+        import sam3 as _sam3
+        sam3_root = os.path.join(os.path.dirname(_sam3.__file__), "..")
+        candidates = [
+            os.path.join(sam3_root, "..", "sam3.pt"),
+            os.path.join(sam3_root, "sam3.pt"),
+            os.path.expanduser("~/sam3.pt"),
+        ]
+        for c in candidates:
+            if os.path.isfile(c):
+                return os.path.abspath(c)
+    except ImportError:
+        pass
+    return None
+
+
+# ---------------------------------------------------------------------------
+# MODE 1: Define exemplar — draw on reference image, save to JSON
+# ---------------------------------------------------------------------------
+def define_exemplar(ref_image_path: str, output_path: str,
+                    processor=None, text_prompt="", device="cpu"):
+    """Define exemplar interactively. If processor is provided, shows live
+    mask preview after each prompt so the user can verify their exemplar."""
+    ref_image = Image.open(ref_image_path).convert("RGB")
+    width, height = ref_image.size
+    ref_name = os.path.basename(ref_image_path)
+
+    exemplar = ExemplarPrompts()
+    drawn_points = []   # (x_norm, y_norm) for display
+    drawn_labels = []
+    drawn_boxes = []    # (cx, cy, w, h, is_pos) normalized
+    undo_stack = []
+
+    # Live preview state
+    preview = {"masks": None, "boxes": None, "scores": None, "show": True}
+
+    drag = {"active": False, "start": None, "rect": None, "ctrl": False}
+    result = {"action": "confirm"}
+
+    fig, ax = plt.subplots(1, 1, figsize=(13, 9))
+    fig.patch.set_facecolor("#2a2a2a")
+    ax.set_facecolor("#2a2a2a")
+
+    def run_preview():
+        """Run model inference with current exemplar to get live mask preview."""
+        if processor is None or exemplar.is_empty():
+            preview["masks"] = None
+            preview["boxes"] = None
+            preview["scores"] = None
+            return
+        try:
+            state = processor.set_image(ref_image)
+            with torch.inference_mode():
+                state = apply_exemplar_prompts(processor, state, text_prompt,
+                                               exemplar, device)
+            masks = state.get("masks")
+            if masks is not None:
+                masks = masks.squeeze(1)
+            preview["masks"] = masks
+            preview["boxes"] = state.get("boxes")
+            preview["scores"] = state.get("scores")
+            n = len(masks) if masks is not None else 0
+            print(f"  preview: {n} object(s) detected")
+        except Exception as e:
+            print(f"  preview failed: {e}")
+            preview["masks"] = None
+            preview["boxes"] = None
+            preview["scores"] = None
+
+    def redraw():
+        ax.clear()
+        ax.axis("off")
+
+        # Show mask overlay if preview available
+        if preview["show"] and preview["masks"] is not None and len(preview["masks"]) > 0:
+            composited, colors = overlay_masks(ref_image, preview["masks"])
+            ax.imshow(composited)
+            if preview["boxes"] is not None and preview["scores"] is not None:
+                _draw_output_boxes(ax, preview["boxes"], preview["scores"], colors)
+        else:
+            ax.imshow(ref_image)
+
+        _draw_points(ax,
+                     [(xn * width, yn * height) for xn, yn in drawn_points],
+                     drawn_labels)
+        _draw_boxes_norm(ax, drawn_boxes, width, height)
+
+        n_pts = len(drawn_points)
+        n_boxes = len(drawn_boxes)
+        info = []
+        if n_pts:
+            info.append(f"{n_pts} pt{'s' if n_pts != 1 else ''}")
+        if n_boxes:
+            info.append(f"{n_boxes} box{'es' if n_boxes != 1 else ''}")
+        info_str = ", ".join(info) if info else "no prompts yet"
+
+        preview_tag = ""
+        if processor is not None:
+            n_det = len(preview["masks"]) if preview["masks"] is not None else 0
+            vis = "ON" if preview["show"] else "OFF"
+            preview_tag = f"  |  preview: {n_det} obj ({vis}) [M] toggle"
+
+        hud = (f"DEFINE EXEMPLAR: {ref_name}  [{info_str}]{preview_tag}    "
+               f"[click] +pt  [Ctrl+click] -pt  [drag] box  [U] undo  "
+               f"[ENTER] save  [Q] cancel")
+        ax.set_title(hud, color="#ffcc00", fontsize=10, fontweight="bold")
+        fig.tight_layout()
+        fig.canvas.draw_idle()
+
+    def on_press(event):
+        if event.inaxes != ax or event.xdata is None or event.button != 1:
+            return
+        drag["start"] = (event.xdata, event.ydata)
+        drag["active"] = False
+        drag["ctrl"] = event.key == "control"
+
+    def on_motion(event):
+        if drag["start"] is None or event.inaxes != ax or event.xdata is None:
+            return
+        sx, sy = drag["start"]
+        if abs(event.xdata - sx) > 5 or abs(event.ydata - sy) > 5:
+            drag["active"] = True
+            if drag["rect"] is not None:
+                drag["rect"].remove()
+            x0 = min(sx, event.xdata)
+            y0 = min(sy, event.ydata)
+            ec = "red" if drag["ctrl"] else "yellow"
+            drag["rect"] = patches.Rectangle(
+                (x0, y0), abs(event.xdata - sx), abs(event.ydata - sy),
+                linewidth=2, edgecolor=ec, facecolor="none", linestyle="--",
+            )
+            ax.add_patch(drag["rect"])
+            fig.canvas.draw_idle()
+
+    def on_release(event):
+        if event.inaxes != ax or event.xdata is None or drag["start"] is None:
+            drag["start"] = None
+            drag["active"] = False
+            if drag["rect"] is not None:
+                drag["rect"].remove()
+                drag["rect"] = None
+            return
+
+        is_positive = not drag["ctrl"]
+
+        if drag["active"]:
+            sx, sy = drag["start"]
+            ex, ey = event.xdata, event.ydata
+            x1, x2 = sorted([sx, ex])
+            y1, y2 = sorted([sy, ey])
+            cx = ((x1 + x2) / 2.0) / width
+            cy = ((y1 + y2) / 2.0) / height
+            w = (x2 - x1) / width
+            h = (y2 - y1) / height
+            exemplar.add_box(cx, cy, w, h, is_positive)
+            drawn_boxes.append((cx, cy, w, h, is_positive))
+            undo_stack.append("box")
+            tag = "positive" if is_positive else "negative"
+            print(f"  {tag} box: ({x1:.0f},{y1:.0f})-({x2:.0f},{y2:.0f})")
+        else:
+            px, py = event.xdata, event.ydata
+            label = 1 if is_positive else 0
+            xn, yn = px / width, py / height
+            exemplar.add_point(xn, yn, label)
+            drawn_points.append((xn, yn))
+            drawn_labels.append(label)
+            undo_stack.append("point")
+            tag = "positive" if label else "negative"
+            print(f"  {tag} point: ({px:.0f}, {py:.0f})")
+
+        drag["start"] = None
+        drag["active"] = False
+        if drag["rect"] is not None:
+            drag["rect"].remove()
+            drag["rect"] = None
+        run_preview()
+        redraw()
+
+    def on_key(event):
+        if event.key in ("enter", "return"):
+            result["action"] = "confirm"
+            plt.close(fig)
+        elif event.key == "q":
+            result["action"] = "quit"
+            plt.close(fig)
+        elif event.key == "m":
+            preview["show"] = not preview["show"]
+            redraw()
+        elif event.key == "u":
+            if not undo_stack:
+                return
+            last = undo_stack.pop()
+            if last == "point":
+                drawn_points.pop()
+                drawn_labels.pop()
+                exemplar.points.pop()
+            elif last == "box":
+                drawn_boxes.pop()
+                exemplar.boxes.pop()
+            print("  undone last prompt")
+            run_preview()
+            redraw()
+
+    fig.canvas.mpl_connect("button_press_event", on_press)
+    fig.canvas.mpl_connect("motion_notify_event", on_motion)
+    fig.canvas.mpl_connect("button_release_event", on_release)
+    fig.canvas.mpl_connect("key_press_event", on_key)
+
+    redraw()
+    plt.show()
+
+    if result["action"] == "quit" or exemplar.is_empty():
+        print("Cancelled — no exemplar saved.")
+        return
+
+    exemplar.save(output_path)
+    print(f"\nExemplar saved to: {output_path}")
+    print(f"  {exemplar.summary()}")
+    print(f"\nNow run segmentation with:")
+    print(f'  python bb_test.py <images> --exemplar {output_path} --text "your prompt"')
+
+
+# ---------------------------------------------------------------------------
+# MODE 2: Predict — run grounding, save masks/boxes/scores to disk
+# ---------------------------------------------------------------------------
+def run_predict(image_paths, text_prompt, exemplar, device, threshold,
+                checkpoint, output_dir, resolution=1008):
+    from sam3 import build_sam3_image_model
+    from sam3.model.sam3_image_processor import Sam3Processor
+
+    if device == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.autocast("cuda", dtype=torch.bfloat16).__enter__()
+
+    build_kwargs = {}
+    if checkpoint:
+        print(f"Using checkpoint: {checkpoint}")
+        build_kwargs["checkpoint_path"] = checkpoint
+        build_kwargs["load_from_HF"] = False
+
+    model = build_sam3_image_model(**build_kwargs)
+    processor = Sam3Processor(model, device=device, confidence_threshold=threshold,
+                              resolution=resolution)
+    print(f"Model loaded (resolution={resolution}).\n")
+
+    os.makedirs(output_dir, exist_ok=True)
+    manifest = []
+
+    for idx, img_path in enumerate(image_paths):
+        fname = os.path.basename(img_path)
+        stem = os.path.splitext(fname)[0]
+        print(f"[{idx + 1}/{len(image_paths)}] {fname}")
+
+        if device == "cuda":
+            torch.cuda.empty_cache()
+        image = Image.open(img_path).convert("RGB")
+        state = processor.set_image(image)
+
+        with torch.inference_mode():
+            state = apply_exemplar_prompts(processor, state, text_prompt,
+                                           exemplar, device)
+
+        masks = state.get("masks")
+        boxes = state.get("boxes")
+        scores = state.get("scores")
+
+        if masks is not None:
+            masks = masks.squeeze(1)
+
+        n = len(masks) if masks is not None else 0
+        print(f"  => {n} object(s) detected")
+
+        entry = {"image_path": os.path.abspath(img_path), "stem": stem}
+        if masks is not None and n > 0:
+            masks_path = os.path.join(output_dir, f"{stem}_masks.npy")
+            boxes_path = os.path.join(output_dir, f"{stem}_boxes.npy")
+            scores_path = os.path.join(output_dir, f"{stem}_scores.npy")
+            np.save(masks_path, masks.cpu().numpy())
+            np.save(boxes_path, boxes.cpu().numpy())
+            np.save(scores_path, scores.cpu().numpy())
+            entry["masks"] = f"{stem}_masks.npy"
+            entry["boxes"] = f"{stem}_boxes.npy"
+            entry["scores"] = f"{stem}_scores.npy"
+        manifest.append(entry)
+
+    manifest_path = os.path.join(output_dir, "manifest.json")
+    with open(manifest_path, "w") as f:
+        json.dump(manifest, f, indent=2)
+
+    print(f"\nPredictions saved to: {output_dir}/")
+    print(f"  {len(manifest)} image(s), manifest: {manifest_path}")
+    print(f"\nNow run interactive refinement with:")
+    print(f"  python bb_test.py --refine {output_dir}/")
+
+
+# ---------------------------------------------------------------------------
+# MODE 3: Refine — load saved predictions, interactive click refinement
+# ---------------------------------------------------------------------------
+def run_refine(predictions_dir, device, checkpoint):
+    from sam3 import build_sam3_image_model
+    from sam3.model.sam3_image_processor import Sam3Processor
+
+    manifest_path = os.path.join(predictions_dir, "manifest.json")
+    if not os.path.isfile(manifest_path):
+        print(f"Error: {manifest_path} not found")
+        sys.exit(1)
+    with open(manifest_path) as f:
+        manifest = json.load(f)
+
+    if not manifest:
+        print("No predictions found in manifest.")
+        return
+
+    if device == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.autocast("cuda", dtype=torch.bfloat16).__enter__()
+
+    build_kwargs = {}
+    if checkpoint:
+        print(f"Using checkpoint: {checkpoint}")
+        build_kwargs["checkpoint_path"] = checkpoint
+        build_kwargs["load_from_HF"] = False
+
+    model = build_sam3_image_model(enable_inst_interactivity=True, **build_kwargs)
+    processor = Sam3Processor(model, device=device)
+    print("Model loaded (interactive refinement mode).\n")
+
+    show_masks = True
+
+    for idx, entry in enumerate(manifest):
+        img_path = entry["image_path"]
+        fname = os.path.basename(img_path)
+        print(f"[{idx + 1}/{len(manifest)}] {fname}")
+
+        if not os.path.isfile(img_path):
+            print(f"  Warning: image not found at {img_path}, skipping")
+            continue
+
+        image = Image.open(img_path).convert("RGB")
+
+        # Only run backbone (set_image) — no text/grounding needed
+        state = processor.set_image(image)
+
+        # Load saved prediction results
+        masks = None
+        boxes = None
+        scores = None
+        if "masks" in entry:
+            masks = torch.from_numpy(
+                np.load(os.path.join(predictions_dir, entry["masks"]))
+            ).to(device)
+            boxes = torch.from_numpy(
+                np.load(os.path.join(predictions_dir, entry["boxes"]))
+            ).to(device)
+            scores = torch.from_numpy(
+                np.load(os.path.join(predictions_dir, entry["scores"]))
+            ).to(device)
+
+        state["masks"] = masks
+        state["boxes"] = boxes
+        state["scores"] = scores
+
+        n = len(masks) if masks is not None else 0
+        print(f"  => {n} object(s) from saved predictions")
+
+        title = f"[{idx + 1}/{len(manifest)}] {fname}"
+        action, show_masks = result_viewer(
+            image, model, state, title, show_masks,
+        )
+        if action == "quit":
+            print("Quit.")
+            break
+
+    print("Done.")
+
+
+def result_viewer(image, model, state, title, show_masks):
+    """Show grounding results. User can click on a detected object to refine
+    its mask using SAM's interactive instance predictor (predict_inst).
+
+    Click = include point, Ctrl+click = exclude point.
+    Refinement is done per-object: click inside a detected box to refine that mask."""
+
+    # Extract grounding results (these stay fixed)
+    grounding_masks = state.get("masks")
+    grounding_boxes = state.get("boxes")
+    grounding_scores = state.get("scores")
+    if grounding_masks is not None:
+        grounding_masks = grounding_masks.squeeze(1)
+
+    n_objects = len(grounding_masks) if grounding_masks is not None else 0
+
+    # Per-object refined masks (start as copies of grounding masks)
+    # refined_masks[i] is an np.ndarray (H, W) or None (use grounding)
+    refined = {
+        "masks": [None] * n_objects,  # None = use grounding mask
+        "logits": [None] * n_objects,  # low-res logits for iterative refinement
+        "points": [[] for _ in range(n_objects)],  # [(px,py), ...]
+        "labels": [[] for _ in range(n_objects)],  # [1 or 0, ...]
+    }
+
+    fig, ax = plt.subplots(1, 1, figsize=(13, 9))
+    fig.patch.set_facecolor("#1e1e1e")
+    ax.set_facecolor("#1e1e1e")
+    action = {"value": "next"}
+
+    def get_display_masks():
+        """Build final mask tensor for display, mixing refined and grounding."""
+        if grounding_masks is None or n_objects == 0:
+            return grounding_masks
+        result = grounding_masks.clone()
+        for i in range(n_objects):
+            if refined["masks"][i] is not None:
+                result[i] = torch.from_numpy(refined["masks"][i]).to(result.device)
+        return result
+
+    def redraw():
+        ax.clear()
+        ax.axis("off")
+        masks = get_display_masks()
+        composited, colors = overlay_masks(image, masks)
+        if show_masks and masks is not None and len(masks) > 0:
+            ax.imshow(composited)
+        else:
+            ax.imshow(image)
+        if grounding_boxes is not None and grounding_scores is not None:
+            _draw_output_boxes(ax, grounding_boxes, grounding_scores, colors)
+
+        # Draw all refinement points
+        for i in range(n_objects):
+            _draw_points(ax, refined["points"][i], refined["labels"][i])
+
+        hud = (f"{title}  —  {n_objects} obj    "
+               f"[click] include  [Ctrl+click] exclude  [U] undo  [R] reset  "
+               f"[M] mask  [SPACE] next  [Q] quit")
+        ax.set_title(hud, color="white", fontsize=9)
+        fig.tight_layout()
+        fig.canvas.draw_idle()
+
+    def find_object_at(px, py):
+        """Find which detected object's box contains (px, py). Returns index or -1."""
+        if grounding_boxes is None:
+            return -1
+        for i, box in enumerate(grounding_boxes):
+            x1, y1, x2, y2 = box.tolist()
+            if x1 <= px <= x2 and y1 <= py <= y2:
+                return i
+        return -1
+
+    def refine_object(obj_idx):
+        """Re-run predict_inst for object obj_idx with its accumulated points."""
+        box = grounding_boxes[obj_idx].cpu().numpy()  # xyxy
+        pts = np.array(refined["points"][obj_idx])  # (N, 2)
+        lbls = np.array(refined["labels"][obj_idx])  # (N,)
+
+        kwargs = {
+            "point_coords": pts,
+            "point_labels": lbls,
+            "box": box[None, :],  # (1, 4)
+            "multimask_output": False,
+        }
+        # Feed previous logits for iterative refinement
+        if refined["logits"][obj_idx] is not None:
+            kwargs["mask_input"] = refined["logits"][obj_idx][None, :, :]
+
+        with torch.inference_mode():
+            masks_np, scores_np, logits_np = model.predict_inst(state, **kwargs)
+
+        # masks_np: (1, H, W), scores_np: (1,), logits_np: (1, 256, 256)
+        refined["masks"][obj_idx] = masks_np[0]
+        refined["logits"][obj_idx] = logits_np[0]
+
+    def on_click(event):
+        if event.inaxes != ax or event.xdata is None or event.button != 1:
+            return
+        px, py = event.xdata, event.ydata
+        is_positive = event.key != "control"
+        label = 1 if is_positive else 0
+
+        obj_idx = find_object_at(px, py)
+        if obj_idx < 0:
+            print(f"  Click at ({px:.0f}, {py:.0f}) — not inside any detected box")
+            return
+
+        refined["points"][obj_idx].append((px, py))
+        refined["labels"][obj_idx].append(label)
+
+        tag = "include" if label else "exclude"
+        print(f"  {tag} point on object {obj_idx}: ({px:.0f}, {py:.0f})")
+
+        refine_object(obj_idx)
+        redraw()
+
+    def on_key(event):
+        nonlocal show_masks
+
+        if event.key in (" ", "d"):
+            action["value"] = "next"
+            plt.close(fig)
+        elif event.key == "q":
+            action["value"] = "quit"
+            plt.close(fig)
+        elif event.key == "m":
+            show_masks = not show_masks
+            redraw()
+        elif event.key == "u":
+            # Undo last point across all objects (find most recent)
+            last_obj = -1
+            for i in range(n_objects):
+                if refined["points"][i]:
+                    last_obj = i
+            if last_obj < 0:
+                return
+            refined["points"][last_obj].pop()
+            refined["labels"][last_obj].pop()
+            if refined["points"][last_obj]:
+                refine_object(last_obj)
+            else:
+                # No more refine points — revert to grounding mask
+                refined["masks"][last_obj] = None
+                refined["logits"][last_obj] = None
+            print(f"  Undone last refine point on object {last_obj}")
+            redraw()
+        elif event.key == "r":
+            for i in range(n_objects):
+                refined["masks"][i] = None
+                refined["logits"][i] = None
+                refined["points"][i].clear()
+                refined["labels"][i].clear()
+            print("  All refinements reset")
+            redraw()
+
+    fig.canvas.mpl_connect("button_press_event", on_click)
+    fig.canvas.mpl_connect("key_press_event", on_key)
+
+    redraw()
+    plt.show()
+    return action["value"], show_masks
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+def main():
+    parser = argparse.ArgumentParser(
+        description="SAM3 segmentation with split predict/refine stages",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+examples:
+  # Step 1: Define exemplar
+  %(prog)s --define-exemplar ref.jpg -o my_exemplar.json
+
+  # Step 2: Predict (saves masks to disk, then frees GPU)
+  %(prog)s --predict images/ --exemplar my_exemplar.json --text "sawfish card"
+
+  # Step 3: Refine interactively (loads saved masks)
+  %(prog)s --refine predictions/
+
+  # Text-only prediction
+  %(prog)s --predict images/ --text "dog"
+""",
+    )
+    # Mode 1: define exemplar
+    parser.add_argument("--define-exemplar", metavar="IMAGE",
+                        help="Draw exemplar prompts on this image and save to JSON")
+    parser.add_argument("-o", "--output", default="exemplar.json",
+                        help="Output path for exemplar JSON (default: exemplar.json)")
+
+    # Mode 2: predict
+    parser.add_argument("--predict", metavar="PATH",
+                        help="Run prediction on image file/dir, save results to disk")
+    parser.add_argument("--predictions-dir", default="predictions",
+                        help="Output directory for predictions (default: predictions/)")
+    parser.add_argument("--text", default="", help="Text prompt")
+    parser.add_argument("--exemplar", default=None, metavar="JSON",
+                        help="Path to saved exemplar JSON file")
+    parser.add_argument("--threshold", type=float, default=0.5,
+                        help="Confidence threshold")
+
+    # Mode 3: refine
+    parser.add_argument("--refine", metavar="DIR",
+                        help="Load predictions from dir and run interactive refinement")
+
+    # Shared
+    parser.add_argument("--checkpoint", default=None, metavar="PATH",
+                        help="Path to SAM3 checkpoint (.pt). Auto-detected if not set.")
+    parser.add_argument("--resolution", type=int, default=1008,
+                        help="Input resolution for SAM3 (default: 1008). "
+                             "Lower values (e.g. 512, 640) use less GPU memory.")
+    args = parser.parse_args()
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    ckpt = args.checkpoint or auto_find_checkpoint()
+
+    # ---- Mode 1: Define exemplar ----
+    if args.define_exemplar:
+        if not os.path.isfile(args.define_exemplar):
+            print(f"Error: {args.define_exemplar} not found")
+            sys.exit(1)
+        print(f"Define exemplar on: {args.define_exemplar}")
+
+        # Load model for live mask preview
+        processor = None
+        try:
+            from sam3 import build_sam3_image_model
+            from sam3.model.sam3_image_processor import Sam3Processor
+
+            if device == "cuda":
+                torch.backends.cuda.matmul.allow_tf32 = True
+                torch.backends.cudnn.allow_tf32 = True
+                torch.autocast("cuda", dtype=torch.bfloat16).__enter__()
+
+            build_kwargs = {}
+            if ckpt:
+                print(f"Using checkpoint: {ckpt}")
+                build_kwargs["checkpoint_path"] = ckpt
+                build_kwargs["load_from_HF"] = False
+
+            print(f"Loading SAM3 model on {device} for live preview...")
+            model = build_sam3_image_model(**build_kwargs)
+            processor = Sam3Processor(model, device=device,
+                                      resolution=args.resolution)
+            print("Model loaded — mask preview enabled.\n")
+        except Exception as e:
+            print(f"Could not load model for preview: {e}")
+            print("Continuing without live preview.\n")
+
+        print("Draw boxes/points, press ENTER to save, Q to cancel.")
+        if processor is not None:
+            print("[M] toggle mask preview\n")
+        define_exemplar(args.define_exemplar, args.output,
+                        processor=processor, text_prompt=args.text,
+                        device=device)
+        return
+
+    # ---- Mode 2: Predict ----
+    if args.predict:
+        images = collect_images(args.predict)
+        if not images:
+            print("No images found.")
+            sys.exit(1)
+        print(f"Found {len(images)} image(s)")
+
+        exemplar = ExemplarPrompts()
+        if args.exemplar:
+            if not os.path.isfile(args.exemplar):
+                print(f"Error: {args.exemplar} not found")
+                sys.exit(1)
+            exemplar = ExemplarPrompts.load(args.exemplar)
+            print(f"Loaded exemplar: {exemplar.summary()}")
+
+        if not args.text and exemplar.is_empty():
+            print("Warning: no --text and no --exemplar given. Results may be empty.")
+
+        print(f"Loading SAM3 model on {device}...")
+        run_predict(images, args.text, exemplar, device, args.threshold, ckpt,
+                    args.predictions_dir, resolution=args.resolution)
+        return
+
+    # ---- Mode 3: Refine ----
+    if args.refine:
+        if not os.path.isdir(args.refine):
+            print(f"Error: {args.refine} is not a directory")
+            sys.exit(1)
+        print(f"Loading SAM3 model on {device} (refinement mode)...")
+        run_refine(args.refine, device, ckpt)
+        return
+
+    parser.error("Use --predict, --refine, or --define-exemplar")
+
+
+if __name__ == "__main__":
+    main()
