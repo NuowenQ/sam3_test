@@ -34,8 +34,10 @@ Exemplar window controls:
 Refinement window controls:
     Click:        add positive refine point
     Ctrl+click:   add negative refine point
+    Right-click:  delete detection (remove box + mask)
     U:            undo last refine point
-    R:            reset refinements (back to prediction result)
+    Z:            undo last deletion
+    R:            reset all (refinements + deletions)
     M:            toggle mask overlay
     SPACE / D:    next image
     Q:            quit
@@ -604,41 +606,59 @@ def result_viewer(image, model, state, title, show_masks):
         "points": [[] for _ in range(n_objects)],  # [(px,py), ...]
         "labels": [[] for _ in range(n_objects)],  # [1 or 0, ...]
     }
+    deleted = set()  # indices of deleted detections
+    deleted_history = []  # stack for undo-delete via [Z]
 
     fig, ax = plt.subplots(1, 1, figsize=(13, 9))
     fig.patch.set_facecolor("#1e1e1e")
     ax.set_facecolor("#1e1e1e")
     action = {"value": "next"}
 
-    def get_display_masks():
-        """Build final mask tensor for display, mixing refined and grounding."""
+    def get_visible_indices():
+        """Return list of object indices that are not deleted."""
+        return [i for i in range(n_objects) if i not in deleted]
+
+    def get_display_data():
+        """Build filtered masks/boxes/scores excluding deleted objects."""
         if grounding_masks is None or n_objects == 0:
-            return grounding_masks
-        result = grounding_masks.clone()
-        for i in range(n_objects):
+            return grounding_masks, grounding_boxes, grounding_scores, []
+        visible = get_visible_indices()
+        if not visible:
+            return None, None, None, []
+        masks = []
+        boxes = []
+        scores = []
+        for i in visible:
             if refined["masks"][i] is not None:
-                result[i] = torch.from_numpy(refined["masks"][i]).to(result.device)
-        return result
+                masks.append(torch.from_numpy(refined["masks"][i]).to(grounding_masks.device))
+            else:
+                masks.append(grounding_masks[i])
+            boxes.append(grounding_boxes[i])
+            scores.append(grounding_scores[i])
+        return torch.stack(masks), torch.stack(boxes), torch.stack(scores), visible
 
     def redraw():
         ax.clear()
         ax.axis("off")
-        masks = get_display_masks()
+        masks, boxes, scores, visible = get_display_data()
         composited, colors = overlay_masks(image, masks)
         if show_masks and masks is not None and len(masks) > 0:
             ax.imshow(composited)
         else:
             ax.imshow(image)
-        if grounding_boxes is not None and grounding_scores is not None:
-            _draw_output_boxes(ax, grounding_boxes, grounding_scores, colors)
+        if boxes is not None and scores is not None:
+            _draw_output_boxes(ax, boxes, scores, colors)
 
-        # Draw all refinement points
-        for i in range(n_objects):
+        # Draw all refinement points for visible objects
+        for i in visible:
             _draw_points(ax, refined["points"][i], refined["labels"][i])
 
-        hud = (f"{title}  —  {n_objects} obj    "
-               f"[click] include  [Ctrl+click] exclude  [U] undo  [R] reset  "
-               f"[M] mask  [SPACE] next  [Q] quit")
+        n_visible = len(visible)
+        n_del = len(deleted)
+        del_str = f" ({n_del} deleted)" if n_del else ""
+        hud = (f"{title}  —  {n_visible} obj{del_str}    "
+               f"[click] include  [Ctrl+click] exclude  [right-click] delete  "
+               f"[U] undo pt  [Z] undo del  [R] reset all  [M] mask  [SPACE] next  [Q] quit")
         ax.set_title(hud, color="white", fontsize=9)
         fig.tight_layout()
         fig.canvas.draw_idle()
@@ -648,6 +668,8 @@ def result_viewer(image, model, state, title, show_masks):
         if grounding_boxes is None:
             return -1
         for i, box in enumerate(grounding_boxes):
+            if i in deleted:
+                continue
             x1, y1, x2, y2 = box.tolist()
             if x1 <= px <= x2 and y1 <= py <= y2:
                 return i
@@ -677,9 +699,26 @@ def result_viewer(image, model, state, title, show_masks):
         refined["logits"][obj_idx] = logits_np[0]
 
     def on_click(event):
-        if event.inaxes != ax or event.xdata is None or event.button != 1:
+        if event.inaxes != ax or event.xdata is None:
             return
         px, py = event.xdata, event.ydata
+
+        # Right-click: delete the detection under cursor
+        if event.button == 3:
+            obj_idx = find_object_at(px, py)
+            if obj_idx < 0:
+                print(f"  Right-click at ({px:.0f}, {py:.0f}) — not inside any detected box")
+                return
+            deleted.add(obj_idx)
+            deleted_history.append(obj_idx)
+            print(f"  Deleted object {obj_idx}")
+            redraw()
+            return
+
+        if event.button != 1:
+            return
+
+        # Left-click: add refinement point
         is_positive = event.key != "control"
         label = 1 if is_positive else 0
 
@@ -727,13 +766,23 @@ def result_viewer(image, model, state, title, show_masks):
                 refined["logits"][last_obj] = None
             print(f"  Undone last refine point on object {last_obj}")
             redraw()
+        elif event.key == "z":
+            if deleted_history:
+                restored = deleted_history.pop()
+                deleted.discard(restored)
+                print(f"  Restored object {restored}")
+                redraw()
+            else:
+                print("  Nothing to restore")
         elif event.key == "r":
             for i in range(n_objects):
                 refined["masks"][i] = None
                 refined["logits"][i] = None
                 refined["points"][i].clear()
                 refined["labels"][i].clear()
-            print("  All refinements reset")
+            deleted.clear()
+            deleted_history.clear()
+            print("  All refinements & deletions reset")
             redraw()
 
     fig.canvas.mpl_connect("button_press_event", on_click)
