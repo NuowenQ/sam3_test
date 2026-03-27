@@ -1,0 +1,234 @@
+[
+  {
+    "image_path": "/home/nuowen/Projects_2026/Sam3/images_test/frame_000009.jpg",
+    "stem": "frame_000009",
+    "masks": "frame_000009_masks.npy",
+    "boxes": "frame_000009_boxes.npy",
+    "scores": "frame_000009_scores.npy",
+    "yolo_txt": "frame_000009.txt"
+  },
+  {
+    "image_path": "/home/nuowen/Projects_2026/Sam3/images_test/frame_000010.jpg",
+    "stem": "frame_000010",
+    "masks": "frame_000010_masks.npy",
+    "boxes": "frame_000010_boxes.npy",
+    "scores": "frame_000010_scores.npy",
+    "yolo_txt": "frame_000010.txt"
+  },
+  {
+    "image_path": "/home/nuowen/Projects_2026/Sam3/images_test/frame_000011.jpg",
+    "stem": "frame_000011",
+    "masks": "frame_000011_masks.npy",
+    "boxes": "frame_000011_boxes.npy",
+    "scores": "frame_000011_scores.npy",
+    "yolo_txt": "frame_000011.txt"
+  },
+  {
+    "image_path": "/home/nuowen/Projects_2026/Sam3/images_test/frame_000012.jpg",
+    "stem": "frame_000012",
+    "masks": "frame_000012_masks.npy",
+    "boxes": "frame_000012_boxes.npy",
+    "scores": "frame_000012_scores.npy",
+    "yolo_txt": "frame_000012.txt"
+  },
+  {
+    "image_path": "/home/nuowen/Projects_2026/Sam3/images_test/frame_000013.jpg",
+    "stem": "frame_000013",
+    "masks": "frame_000013_masks.npy",
+    "boxes": "frame_000013_boxes.npy",
+    "scores": "frame_000013_scores.npy",
+    "yolo_txt": "frame_000013.txt"
+  },
+  {
+    "image_path": "/home/nuowen/Projects_2026/Sam3/images_test/frame_000014.jpg",
+    "stem": "frame_000014",
+    "masks": "frame_000014_masks.npy",
+    "boxes": "frame_000014_boxes.npy",
+    "scores": "frame_000014_scores.npy",
+    "yolo_txt": "frame_000014.txt"
+  },
+  {
+    "image_path": "/home/nuowen/Projects_2026/Sam3/images_test/frame_000015.jpg",
+    "stem": "frame_000015",
+    "masks": "frame_000015_masks.npy",
+    "boxes": "frame_000015_boxes.npy",
+    "scores": "frame_000015_scores.npy",
+    "yolo_txt": "frame_000015.txt"
+  },
+  {
+    "image_path": "/home/nuowen/Projects_2026/Sam3/images_test/frame_000016.jpg",
+    "stem": "frame_000016",
+    "masks": "frame_000016_masks.npy",
+    "boxes": "frame_000016_boxes.npy",
+    "scores": "frame_000016_scores.npy",
+    "yolo_txt": "frame_000016.txt"
+  },
+  {
+    "image_path": "/home/nuowen/Projects_2026/Sam3/images_test/frame_000017.jpg",
+    "stem": "frame_000017",
+    "masks": "frame_000017_masks.npy",
+    "boxes": "frame_000017_boxes.npy",
+    "scores": "frame_000017_scores.npy",
+    "yolo_txt": "frame_000017.txt"
+  },
+  {
+    "image_path": "/home/nuowen/Projects_2026/Sam3/images_test/frame_000018.jpg",
+    "stem": "frame_000018",
+    "masks": "frame_000018_masks.npy",
+    "boxes": "frame_000018_boxes.npy",
+    "scores": "frame_000018_scores.npy",
+    "yolo_txt": "frame_000018.txt"
+  },
+  {
+    "image_path": "/home/nuowen/Projects_2026/Sam3/images_test/frame_000019.jpg",
+    "stem": "frame_000019",
+    "masks": "frame_000019_masks.npy",
+    "boxes": "frame_000019_boxes.npy",
+    "scores": "frame_000019_scores.npy",
+    "yolo_txt": "frame_000019.txt"
+  },
+  {
+    "image_path": "/home/nuowen/Projects_2026/Sam3/images_test/frame_000020.jpg",
+    "stem": "frame_000020",
+    "masks": "frame_000020_masks.npy",
+    "boxes": "frame_000020_boxes.npy",
+    "scores": "frame_000020_scores.npy",
+    "yolo_txt": "frame_000020.txt"
+  },
+  {
+    "image_path": "/home/nuowen/Projects_2026/Sam3/images_test/frame_000022.jpg",
+    "stem": "frame_000022",
+    "masks": "frame_000022_masks.npy",
+    "boxes": "frame_000022_boxes.npy",
+    "scores": "frame_000022_scores.npy",
+    "yolo_txt": "frame_000022.txt"
+  },
+  {
+    "image_path": "/home/nuowen/Projects_2026/Sam3/images_test/frame_000023.jpg",
+    "stem": "frame_000023",
+    "masks": "frame_000023_masks.npy",
+    "boxes": "frame_000023_boxes.npy",
+    "scores": "frame_000023_scores.npy",
+    "yolo_txt": "frame_000023.txt"
+  },
+  {
+    "image_path": "/home/nuowen/Projects_2026/Sam3/images_test/frame_000026.jpg",
+    "stem": "frame_000026",
+    "masks": "frame_000026_masks.npy",
+    "boxes": "frame_000026_boxes.npy",
+    "scores": "frame_000026_scores.npy",
+    "yolo_txt": "frame_000026.txt"
+  },
+  {
+    "image_path": "/home/nuowen/Projects_2026/Sam3/images_test/frame_000045.jpg",
+    "stem": "frame_000045"
+  },
+  {
+    "image_path": "/home/nuowen/Projects_2026/Sam3/images_test/frame_000056.jpg",
+    "stem": "frame_000056"
+  },
+  {
+    "image_path": "/home/nuowen/Projects_2026/Sam3/images_test/frame_000058.jpg",
+    "stem": "frame_000058",
+    "masks": "frame_000058_masks.npy",
+    "boxes": "frame_000058_boxes.npy",
+    "scores": "frame_000058_scores.npy",
+    "yolo_txt": "frame_000058.txt"
+  },
+  {
+    "image_path": "/home/nuowen/Projects_2026/Sam3/images_test/frame_000060.jpg",
+    "stem": "frame_000060",
+    "masks": "frame_000060_masks.npy",
+    "boxes": "frame_000060_boxes.npy",
+    "scores": "frame_000060_scores.npy",
+    "yolo_txt": "frame_000060.txt"
+  },
+  {
+    "image_path": "/home/nuowen/Projects_2026/Sam3/images_test/frame_000061.jpg",
+    "stem": "frame_000061",
+    "masks": "frame_000061_masks.npy",
+    "boxes": "frame_000061_boxes.npy",
+    "scores": "frame_000061_scores.npy",
+    "yolo_txt": "frame_000061.txt"
+  },
+  {
+    "image_path": "/home/nuowen/Projects_2026/Sam3/images_test/frame_000065.jpg",
+    "stem": "frame_000065",
+    "masks": "frame_000065_masks.npy",
+    "boxes": "frame_000065_boxes.npy",
+    "scores": "frame_000065_scores.npy",
+    "yolo_txt": "frame_000065.txt"
+  },
+  {
+    "image_path": "/home/nuowen/Projects_2026/Sam3/images_test/frame_000066.jpg",
+    "stem": "frame_000066",
+    "masks": "frame_000066_masks.npy",
+    "boxes": "frame_000066_boxes.npy",
+    "scores": "frame_000066_scores.npy",
+    "yolo_txt": "frame_000066.txt"
+  },
+  {
+    "image_path": "/home/nuowen/Projects_2026/Sam3/images_test/frame_000067.jpg",
+    "stem": "frame_000067",
+    "masks": "frame_000067_masks.npy",
+    "boxes": "frame_000067_boxes.npy",
+    "scores": "frame_000067_scores.npy",
+    "yolo_txt": "frame_000067.txt"
+  },
+  {
+    "image_path": "/home/nuowen/Projects_2026/Sam3/images_test/frame_000071.jpg",
+    "stem": "frame_000071",
+    "masks": "frame_000071_masks.npy",
+    "boxes": "frame_000071_boxes.npy",
+    "scores": "frame_000071_scores.npy",
+    "yolo_txt": "frame_000071.txt"
+  },
+  {
+    "image_path": "/home/nuowen/Projects_2026/Sam3/images_test/frame_000072.jpg",
+    "stem": "frame_000072",
+    "masks": "frame_000072_masks.npy",
+    "boxes": "frame_000072_boxes.npy",
+    "scores": "frame_000072_scores.npy",
+    "yolo_txt": "frame_000072.txt"
+  },
+  {
+    "image_path": "/home/nuowen/Projects_2026/Sam3/images_test/frame_000075.jpg",
+    "stem": "frame_000075",
+    "masks": "frame_000075_masks.npy",
+    "boxes": "frame_000075_boxes.npy",
+    "scores": "frame_000075_scores.npy",
+    "yolo_txt": "frame_000075.txt"
+  },
+  {
+    "image_path": "/home/nuowen/Projects_2026/Sam3/images_test/frame_000076.jpg",
+    "stem": "frame_000076",
+    "masks": "frame_000076_masks.npy",
+    "boxes": "frame_000076_boxes.npy",
+    "scores": "frame_000076_scores.npy",
+    "yolo_txt": "frame_000076.txt"
+  },
+  {
+    "image_path": "/home/nuowen/Projects_2026/Sam3/images_test/frame_000077.jpg",
+    "stem": "frame_000077",
+    "masks": "frame_000077_masks.npy",
+    "boxes": "frame_000077_boxes.npy",
+    "scores": "frame_000077_scores.npy",
+    "yolo_txt": "frame_000077.txt"
+  },
+  {
+    "image_path": "/home/nuowen/Projects_2026/Sam3/images_test/frame_000080.jpg",
+    "stem": "frame_000080",
+    "masks": "frame_000080_masks.npy",
+    "boxes": "frame_000080_boxes.npy",
+    "scores": "frame_000080_scores.npy",
+    "yolo_txt": "frame_000080.txt"
+  },
+  {
+    "image_path": "/home/nuowen/Projects_2026/Sam3/images_test/frame_000081.jpg",
+    "stem": "frame_000081",
+    "masks": "frame_000081_masks.npy",
+    "boxes": "frame_000081_boxes.npy",
+    "scores": "frame_000081_scores.npy",
+    "yolo_txt": "frame_000081.txt"
+  }
+]

@@ -23,11 +23,9 @@ Usage:
     python bb_test.py --predict images/ --text "dog"
 
 Exemplar window controls:
-    Click:        add positive point (green star)
-    Ctrl+click:   add negative point (red star)
     Drag:         draw positive box
     Ctrl+drag:    draw negative box
-    U:            undo last prompt
+    U:            undo last box
     ENTER:        save & quit
     Q:            cancel
 
@@ -39,8 +37,8 @@ Refinement window controls:
     Z:            undo last deletion
     R:            reset all (refinements + deletions)
     M:            toggle mask overlay
-    SPACE / D:    next image
-    Q:            quit
+    SPACE / D:    save & next image
+    Q:            save & quit
 """
 import argparse
 import glob
@@ -63,28 +61,21 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 # ---------------------------------------------------------------------------
 class ExemplarPrompts:
     def __init__(self):
-        self.points = []  # [(x_norm, y_norm, label), ...]
         self.boxes = []   # [(cx_norm, cy_norm, w_norm, h_norm, is_positive), ...]
-
-    def add_point(self, x_norm, y_norm, label):
-        self.points.append((x_norm, y_norm, int(label)))
 
     def add_box(self, cx, cy, w, h, is_positive):
         self.boxes.append((cx, cy, w, h, bool(is_positive)))
 
     def is_empty(self):
-        return not self.points and not self.boxes
+        return not self.boxes
 
     def summary(self):
-        parts = []
-        if self.points:
-            parts.append(f"{len(self.points)} point(s)")
         if self.boxes:
-            parts.append(f"{len(self.boxes)} box(es)")
-        return ", ".join(parts) if parts else "empty"
+            return f"{len(self.boxes)} box(es)"
+        return "empty"
 
     def save(self, path):
-        data = {"points": self.points, "boxes": self.boxes}
+        data = {"boxes": self.boxes}
         with open(path, "w") as f:
             json.dump(data, f, indent=2)
 
@@ -93,7 +84,6 @@ class ExemplarPrompts:
         with open(path) as f:
             data = json.load(f)
         ex = cls()
-        ex.points = [tuple(p) for p in data.get("points", [])]
         ex.boxes = [tuple(b) for b in data.get("boxes", [])]
         return ex
 
@@ -101,6 +91,27 @@ class ExemplarPrompts:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+def mask_to_yolo_polygon(mask_np, img_h, img_w, epsilon_factor=0.001):
+    """Convert a binary mask (H, W) to a YOLO normalized polygon.
+    Returns list of (x_norm, y_norm) pairs, or empty list if no contour found."""
+    import cv2
+    mask_uint8 = (mask_np > 0).astype(np.uint8) * 255
+    contours, _ = cv2.findContours(mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return []
+    # Pick the largest contour
+    contour = max(contours, key=cv2.contourArea)
+    # Simplify to reduce point count
+    epsilon = epsilon_factor * cv2.arcLength(contour, True)
+    contour = cv2.approxPolyDP(contour, epsilon, True)
+    contour = contour.squeeze(1)  # (N, 2) — x, y in pixels
+    # Normalize to [0, 1]
+    coords = []
+    for x, y in contour:
+        coords.append((x / img_w, y / img_h))
+    return coords
+
+
 def collect_images(path: str) -> list[str]:
     if os.path.isfile(path):
         return [os.path.abspath(path)]
@@ -189,7 +200,7 @@ def add_point_prompt(processor, state, px_norm, py_norm, label, device):
 
 
 @torch.inference_mode()
-def apply_exemplar_prompts(processor, state, text_prompt, exemplar, device):
+def apply_exemplar_prompts(processor, state, text_prompt, exemplar):
     if text_prompt:
         state = processor.set_text_prompt(prompt=text_prompt, state=state)
     if exemplar is None or exemplar.is_empty():
@@ -198,8 +209,6 @@ def apply_exemplar_prompts(processor, state, text_prompt, exemplar, device):
         state = processor.add_geometric_prompt(
             state=state, box=[cx, cy, w, h], label=is_positive
         )
-    for xn, yn, label in exemplar.points:
-        state = add_point_prompt(processor, state, xn, yn, label, device)
     return state
 
 
@@ -223,22 +232,14 @@ def auto_find_checkpoint():
 # ---------------------------------------------------------------------------
 # MODE 1: Define exemplar — draw on reference image, save to JSON
 # ---------------------------------------------------------------------------
-def define_exemplar(ref_image_path: str, output_path: str,
-                    processor=None, text_prompt="", device="cpu"):
-    """Define exemplar interactively. If processor is provided, shows live
-    mask preview after each prompt so the user can verify their exemplar."""
+def define_exemplar(ref_image_path: str, output_path: str):
+    """Define exemplar by drawing bounding boxes on a reference image."""
     ref_image = Image.open(ref_image_path).convert("RGB")
     width, height = ref_image.size
     ref_name = os.path.basename(ref_image_path)
 
     exemplar = ExemplarPrompts()
-    drawn_points = []   # (x_norm, y_norm) for display
-    drawn_labels = []
     drawn_boxes = []    # (cx, cy, w, h, is_pos) normalized
-    undo_stack = []
-
-    # Live preview state
-    preview = {"masks": None, "boxes": None, "scores": None, "show": True}
 
     drag = {"active": False, "start": None, "rect": None, "ctrl": False}
     result = {"action": "confirm"}
@@ -247,67 +248,17 @@ def define_exemplar(ref_image_path: str, output_path: str,
     fig.patch.set_facecolor("#2a2a2a")
     ax.set_facecolor("#2a2a2a")
 
-    def run_preview():
-        """Run model inference with current exemplar to get live mask preview."""
-        if processor is None or exemplar.is_empty():
-            preview["masks"] = None
-            preview["boxes"] = None
-            preview["scores"] = None
-            return
-        try:
-            state = processor.set_image(ref_image)
-            with torch.inference_mode():
-                state = apply_exemplar_prompts(processor, state, text_prompt,
-                                               exemplar, device)
-            masks = state.get("masks")
-            if masks is not None:
-                masks = masks.squeeze(1)
-            preview["masks"] = masks
-            preview["boxes"] = state.get("boxes")
-            preview["scores"] = state.get("scores")
-            n = len(masks) if masks is not None else 0
-            print(f"  preview: {n} object(s) detected")
-        except Exception as e:
-            print(f"  preview failed: {e}")
-            preview["masks"] = None
-            preview["boxes"] = None
-            preview["scores"] = None
-
     def redraw():
         ax.clear()
         ax.axis("off")
-
-        # Show mask overlay if preview available
-        if preview["show"] and preview["masks"] is not None and len(preview["masks"]) > 0:
-            composited, colors = overlay_masks(ref_image, preview["masks"])
-            ax.imshow(composited)
-            if preview["boxes"] is not None and preview["scores"] is not None:
-                _draw_output_boxes(ax, preview["boxes"], preview["scores"], colors)
-        else:
-            ax.imshow(ref_image)
-
-        _draw_points(ax,
-                     [(xn * width, yn * height) for xn, yn in drawn_points],
-                     drawn_labels)
+        ax.imshow(ref_image)
         _draw_boxes_norm(ax, drawn_boxes, width, height)
 
-        n_pts = len(drawn_points)
         n_boxes = len(drawn_boxes)
-        info = []
-        if n_pts:
-            info.append(f"{n_pts} pt{'s' if n_pts != 1 else ''}")
-        if n_boxes:
-            info.append(f"{n_boxes} box{'es' if n_boxes != 1 else ''}")
-        info_str = ", ".join(info) if info else "no prompts yet"
+        info_str = f"{n_boxes} box{'es' if n_boxes != 1 else ''}" if n_boxes else "no boxes yet"
 
-        preview_tag = ""
-        if processor is not None:
-            n_det = len(preview["masks"]) if preview["masks"] is not None else 0
-            vis = "ON" if preview["show"] else "OFF"
-            preview_tag = f"  |  preview: {n_det} obj ({vis}) [M] toggle"
-
-        hud = (f"DEFINE EXEMPLAR: {ref_name}  [{info_str}]{preview_tag}    "
-               f"[click] +pt  [Ctrl+click] -pt  [drag] box  [U] undo  "
+        hud = (f"DEFINE EXEMPLAR: {ref_name}  [{info_str}]    "
+               f"[drag] +box  [Ctrl+drag] -box  [U] undo  "
                f"[ENTER] save  [Q] cancel")
         ax.set_title(hud, color="#ffcc00", fontsize=10, fontweight="bold")
         fig.tight_layout()
@@ -347,39 +298,30 @@ def define_exemplar(ref_image_path: str, output_path: str,
                 drag["rect"] = None
             return
 
-        is_positive = not drag["ctrl"]
+        if not drag["active"]:
+            # Simple click — ignore (exemplar is box-only)
+            drag["start"] = None
+            return
 
-        if drag["active"]:
-            sx, sy = drag["start"]
-            ex, ey = event.xdata, event.ydata
-            x1, x2 = sorted([sx, ex])
-            y1, y2 = sorted([sy, ey])
-            cx = ((x1 + x2) / 2.0) / width
-            cy = ((y1 + y2) / 2.0) / height
-            w = (x2 - x1) / width
-            h = (y2 - y1) / height
-            exemplar.add_box(cx, cy, w, h, is_positive)
-            drawn_boxes.append((cx, cy, w, h, is_positive))
-            undo_stack.append("box")
-            tag = "positive" if is_positive else "negative"
-            print(f"  {tag} box: ({x1:.0f},{y1:.0f})-({x2:.0f},{y2:.0f})")
-        else:
-            px, py = event.xdata, event.ydata
-            label = 1 if is_positive else 0
-            xn, yn = px / width, py / height
-            exemplar.add_point(xn, yn, label)
-            drawn_points.append((xn, yn))
-            drawn_labels.append(label)
-            undo_stack.append("point")
-            tag = "positive" if label else "negative"
-            print(f"  {tag} point: ({px:.0f}, {py:.0f})")
+        is_positive = not drag["ctrl"]
+        sx, sy = drag["start"]
+        ex, ey = event.xdata, event.ydata
+        x1, x2 = sorted([sx, ex])
+        y1, y2 = sorted([sy, ey])
+        cx = ((x1 + x2) / 2.0) / width
+        cy = ((y1 + y2) / 2.0) / height
+        w = (x2 - x1) / width
+        h = (y2 - y1) / height
+        exemplar.add_box(cx, cy, w, h, is_positive)
+        drawn_boxes.append((cx, cy, w, h, is_positive))
+        tag = "positive" if is_positive else "negative"
+        print(f"  {tag} box: ({x1:.0f},{y1:.0f})-({x2:.0f},{y2:.0f})")
 
         drag["start"] = None
         drag["active"] = False
         if drag["rect"] is not None:
             drag["rect"].remove()
             drag["rect"] = None
-        run_preview()
         redraw()
 
     def on_key(event):
@@ -389,22 +331,12 @@ def define_exemplar(ref_image_path: str, output_path: str,
         elif event.key == "q":
             result["action"] = "quit"
             plt.close(fig)
-        elif event.key == "m":
-            preview["show"] = not preview["show"]
-            redraw()
         elif event.key == "u":
-            if not undo_stack:
+            if not drawn_boxes:
                 return
-            last = undo_stack.pop()
-            if last == "point":
-                drawn_points.pop()
-                drawn_labels.pop()
-                exemplar.points.pop()
-            elif last == "box":
-                drawn_boxes.pop()
-                exemplar.boxes.pop()
-            print("  undone last prompt")
-            run_preview()
+            drawn_boxes.pop()
+            exemplar.boxes.pop()
+            print("  undone last box")
             redraw()
 
     fig.canvas.mpl_connect("button_press_event", on_press)
@@ -423,7 +355,7 @@ def define_exemplar(ref_image_path: str, output_path: str,
     print(f"\nExemplar saved to: {output_path}")
     print(f"  {exemplar.summary()}")
     print(f"\nNow run segmentation with:")
-    print(f'  python bb_test.py <images> --exemplar {output_path} --text "your prompt"')
+    print(f'  python bb_test.py --predict <images> --exemplar {output_path} --text "your prompt"')
 
 
 # ---------------------------------------------------------------------------
@@ -465,7 +397,7 @@ def run_predict(image_paths, text_prompt, exemplar, device, threshold,
 
         with torch.inference_mode():
             state = apply_exemplar_prompts(processor, state, text_prompt,
-                                           exemplar, device)
+                                           exemplar)
 
         masks = state.get("masks")
         boxes = state.get("boxes")
@@ -478,21 +410,47 @@ def run_predict(image_paths, text_prompt, exemplar, device, threshold,
         print(f"  => {n} object(s) detected")
 
         entry = {"image_path": os.path.abspath(img_path), "stem": stem}
+        # Move results to CPU and free GPU memory before saving
+        if masks is not None:
+            masks = masks.cpu().float()
+        if boxes is not None:
+            boxes = boxes.cpu().float()
+        if scores is not None:
+            scores = scores.cpu().float()
+        # Free all GPU tensors from this image's state
+        del state
+        if device == "cuda":
+            torch.cuda.empty_cache()
+
         if masks is not None and n > 0:
             masks_path = os.path.join(output_dir, f"{stem}_masks.npy")
             boxes_path = os.path.join(output_dir, f"{stem}_boxes.npy")
             scores_path = os.path.join(output_dir, f"{stem}_scores.npy")
-            np.save(masks_path, masks.cpu().float().numpy())
-            np.save(boxes_path, boxes.cpu().float().numpy())
-            np.save(scores_path, scores.cpu().float().numpy())
+            np.save(masks_path, masks.numpy())
+            np.save(boxes_path, boxes.numpy())
+            np.save(scores_path, scores.numpy())
             entry["masks"] = f"{stem}_masks.npy"
             entry["boxes"] = f"{stem}_boxes.npy"
             entry["scores"] = f"{stem}_scores.npy"
+
+            # Save YOLO segmentation format (.txt)
+            img_h, img_w = image.size[1], image.size[0]
+            masks_np = masks.numpy()
+            txt_path = os.path.join(output_dir, f"{stem}.txt")
+            with open(txt_path, "w") as f:
+                for mask_i in masks_np:
+                    polygon = mask_to_yolo_polygon(mask_i, img_h, img_w)
+                    if not polygon:
+                        continue
+                    coords_str = " ".join(f"{x:.5f} {y:.5f}" for x, y in polygon)
+                    f.write(f"0 {coords_str}\n")
+            entry["yolo_txt"] = f"{stem}.txt"
         manifest.append(entry)
 
-    manifest_path = os.path.join(output_dir, "manifest.json")
-    with open(manifest_path, "w") as f:
-        json.dump(manifest, f, indent=2)
+        # Write manifest after each image so it's available even if we crash
+        manifest_path = os.path.join(output_dir, "manifest.json")
+        with open(manifest_path, "w") as f:
+            json.dump(manifest, f, indent=2)
 
     print(f"\nPredictions saved to: {output_dir}/")
     print(f"  {len(manifest)} image(s), manifest: {manifest_path}")
@@ -507,15 +465,39 @@ def run_refine(predictions_dir, device, checkpoint):
     from sam3 import build_sam3_image_model
     from sam3.model.sam3_image_processor import Sam3Processor
 
-    manifest_path = os.path.join(predictions_dir, "manifest.json")
-    if not os.path.isfile(manifest_path):
-        print(f"Error: {manifest_path} not found")
+    # Scan for prediction files directly (no manifest needed)
+    mask_files = sorted(glob.glob(os.path.join(predictions_dir, "*_masks.npy")))
+    if not mask_files:
+        print(f"Error: no *_masks.npy files found in {predictions_dir}")
         sys.exit(1)
-    with open(manifest_path) as f:
-        manifest = json.load(f)
+
+    # Build entries from the npy files
+    manifest = []
+    for mf in mask_files:
+        stem = os.path.basename(mf).replace("_masks.npy", "")
+        # Find matching image in the images_test dir or from the npy's parent
+        img_candidates = glob.glob(os.path.join(predictions_dir, "..", "**", f"{stem}.*"), recursive=True)
+        img_path = None
+        for c in img_candidates:
+            if os.path.splitext(c)[1].lower() in IMAGE_EXTENSIONS:
+                img_path = os.path.abspath(c)
+                break
+        if img_path is None:
+            # Try common image dirs
+            for d in [os.path.join(predictions_dir, ".."), "/home/nuowen/Projects_2026/Sam3/images_test"]:
+                for ext in [".jpg", ".jpeg", ".png"]:
+                    p = os.path.join(d, f"{stem}{ext}")
+                    if os.path.isfile(p):
+                        img_path = os.path.abspath(p)
+                        break
+                if img_path:
+                    break
+        manifest.append({"stem": stem, "image_path": img_path,
+                         "masks": f"{stem}_masks.npy", "boxes": f"{stem}_boxes.npy",
+                         "scores": f"{stem}_scores.npy"})
 
     if not manifest:
-        print("No predictions found in manifest.")
+        print("No predictions found.")
         return
 
     if device == "cuda":
@@ -572,9 +554,37 @@ def run_refine(predictions_dir, device, checkpoint):
         print(f"  => {n} object(s) from saved predictions")
 
         title = f"[{idx + 1}/{len(manifest)}] {fname}"
-        action, show_masks = result_viewer(
+        action, show_masks, final_masks, final_boxes, final_scores = result_viewer(
             image, model, state, title, show_masks,
         )
+
+        # Save refined results
+        stem = entry["stem"]
+        img_h, img_w = image.size[1], image.size[0]
+        if final_masks is not None and len(final_masks) > 0:
+            masks_np = final_masks.cpu().float().numpy()
+            boxes_np = final_boxes.cpu().float().numpy()
+            scores_np = final_scores.cpu().float().numpy()
+            np.save(os.path.join(predictions_dir, f"{stem}_masks.npy"), masks_np)
+            np.save(os.path.join(predictions_dir, f"{stem}_boxes.npy"), boxes_np)
+            np.save(os.path.join(predictions_dir, f"{stem}_scores.npy"), scores_np)
+
+            txt_path = os.path.join(predictions_dir, f"{stem}.txt")
+            with open(txt_path, "w") as f:
+                for mask_i in masks_np:
+                    polygon = mask_to_yolo_polygon(mask_i, img_h, img_w)
+                    if not polygon:
+                        continue
+                    coords_str = " ".join(f"{x:.5f} {y:.5f}" for x, y in polygon)
+                    f.write(f"0 {coords_str}\n")
+            print(f"  Saved refined results ({len(masks_np)} obj)")
+        else:
+            # All detections deleted — write empty files
+            txt_path = os.path.join(predictions_dir, f"{stem}.txt")
+            with open(txt_path, "w") as f:
+                pass
+            print(f"  Saved (0 obj)")
+
         if action == "quit":
             print("Quit.")
             break
@@ -639,10 +649,19 @@ def result_viewer(image, model, state, title, show_masks):
         visible = get_visible_indices()
         for i in visible:
             if refined["masks"][i] is not None:
-                masks.append(torch.from_numpy(refined["masks"][i]).to(device))
+                m = torch.from_numpy(refined["masks"][i]).to(device)
+                masks.append(m)
+                # Recompute box from refined mask
+                ys, xs = torch.where(m > 0.5)
+                if len(ys) > 0:
+                    box = torch.tensor([xs.min(), ys.min(), xs.max(), ys.max()],
+                                       dtype=torch.float32, device=device)
+                    boxes.append(box)
+                else:
+                    boxes.append(grounding_boxes[i])
             else:
                 masks.append(grounding_masks[i])
-            boxes.append(grounding_boxes[i])
+                boxes.append(grounding_boxes[i])
             scores.append(grounding_scores[i])
 
         # Custom (user-created) detections
@@ -679,7 +698,7 @@ def result_viewer(image, model, state, title, show_masks):
         del_str = f" ({n_del} deleted)" if n_del else ""
         hud = (f"{title}  —  {n_total} obj{del_str}    "
                f"[click] include  [Ctrl+click] exclude  [right-click] delete  "
-               f"[U] undo pt  [Z] undo del  [R] reset all  [M] mask  [SPACE] next  [Q] quit")
+               f"[U] undo pt  [Z] undo del  [R] reset all  [M] mask  [SPACE] save & next  [Q] save & quit")
         ax.set_title(hud, color="white", fontsize=9)
         fig.tight_layout()
         fig.canvas.draw_idle()
@@ -891,7 +910,10 @@ def result_viewer(image, model, state, title, show_masks):
 
     redraw()
     plt.show()
-    return action["value"], show_masks
+
+    # Collect final state for saving
+    final_masks, final_boxes, final_scores, _ = get_display_data()
+    return action["value"], show_masks, final_masks, final_boxes, final_scores
 
 
 # ---------------------------------------------------------------------------
@@ -954,39 +976,8 @@ examples:
             print(f"Error: {args.define_exemplar} not found")
             sys.exit(1)
         print(f"Define exemplar on: {args.define_exemplar}")
-
-        # Load model for live mask preview
-        processor = None
-        try:
-            from sam3 import build_sam3_image_model
-            from sam3.model.sam3_image_processor import Sam3Processor
-
-            if device == "cuda":
-                torch.backends.cuda.matmul.allow_tf32 = True
-                torch.backends.cudnn.allow_tf32 = True
-                torch.autocast("cuda", dtype=torch.bfloat16).__enter__()
-
-            build_kwargs = {}
-            if ckpt:
-                print(f"Using checkpoint: {ckpt}")
-                build_kwargs["checkpoint_path"] = ckpt
-                build_kwargs["load_from_HF"] = False
-
-            print(f"Loading SAM3 model on {device} for live preview...")
-            model = build_sam3_image_model(**build_kwargs)
-            processor = Sam3Processor(model, device=device,
-                                      resolution=args.resolution)
-            print("Model loaded — mask preview enabled.\n")
-        except Exception as e:
-            print(f"Could not load model for preview: {e}")
-            print("Continuing without live preview.\n")
-
-        print("Draw boxes/points, press ENTER to save, Q to cancel.")
-        if processor is not None:
-            print("[M] toggle mask preview\n")
-        define_exemplar(args.define_exemplar, args.output,
-                        processor=processor, text_prompt=args.text,
-                        device=device)
+        print("Draw box(es) around the object to segment, press ENTER to save, Q to cancel.\n")
+        define_exemplar(args.define_exemplar, args.output)
         return
 
     # ---- Mode 2: Predict ----
