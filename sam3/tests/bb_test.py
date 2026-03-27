@@ -362,7 +362,7 @@ def define_exemplar(ref_image_path: str, output_path: str):
 # MODE 2: Predict — run grounding, save masks/boxes/scores to disk
 # ---------------------------------------------------------------------------
 def run_predict(image_paths, text_prompt, exemplar, device, threshold,
-                checkpoint, output_dir, resolution=1008):
+                checkpoint, output_dir, resolution=1008, dataset_dir=""):
     from sam3 import build_sam3_image_model
     from sam3.model.sam3_image_processor import Sam3Processor
 
@@ -383,6 +383,11 @@ def run_predict(image_paths, text_prompt, exemplar, device, threshold,
     print(f"Model loaded (resolution={resolution}).\n")
 
     os.makedirs(output_dir, exist_ok=True)
+    if dataset_dir:
+        ds_images = os.path.join(dataset_dir, "images", "train")
+        ds_labels = os.path.join(dataset_dir, "labels", "train")
+        os.makedirs(ds_images, exist_ok=True)
+        os.makedirs(ds_labels, exist_ok=True)
     manifest = []
 
     for idx, img_path in enumerate(image_paths):
@@ -445,6 +450,14 @@ def run_predict(image_paths, text_prompt, exemplar, device, threshold,
                     coords_str = " ".join(f"{x:.5f} {y:.5f}" for x, y in polygon)
                     f.write(f"0 {coords_str}\n")
             entry["yolo_txt"] = f"{stem}.txt"
+
+        # Copy image + label into Ultralytics dataset layout if requested
+        if dataset_dir:
+            import shutil
+            shutil.copy(img_path, os.path.join(ds_images, fname))
+            if "yolo_txt" in entry:
+                shutil.copy(txt_path, os.path.join(ds_labels, f"{stem}.txt"))
+
         manifest.append(entry)
 
         # Write manifest after each image so it's available even if we crash
